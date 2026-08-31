@@ -10,6 +10,7 @@ import { Logger } from "@utils/Logger";
 import definePlugin, { OptionType } from "@utils/types";
 import {
     ApplicationStreamingStore,
+    ChannelStore,
     FluxDispatcher,
     SelectedChannelStore,
     showToast,
@@ -262,7 +263,9 @@ function applyDisplayMode(channelId: string, streamKey: string) {
     } else if (displayMode === "popout") {
         dispatch({ type: "CALL_TILE_POPOUT_WINDOW_OPEN", channelId, participantId: streamKey });
     } else {
-        dispatch({ type: "CHANNEL_RTC_UPDATE_LAYOUT", channelId, layout: "normal", appContext: "APP" });
+        const channel = ChannelStore.getChannel(channelId);
+        const layout = channel?.isGuildVocalOrThread() ? "no-chat" : "normal";
+        dispatch({ type: "CHANNEL_RTC_UPDATE_LAYOUT", channelId, layout, appContext: "APP" });
     }
 }
 
