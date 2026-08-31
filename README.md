@@ -13,7 +13,7 @@ AutoJoinStream never moves you into another voice channel.
 - Temporary focus locking, including optional locking after manual selection.
 - Ordered user priorities plus user, server, and channel allow/block lists.
 - Configurable switch delay and cooldown.
-- Normal, fullscreen, and stream pop-out display modes.
+- Normal, side-by-side grid, fullscreen, and stream pop-out display modes.
 - Notifications and compatibility error reporting.
 - `/autostream` commands for status, locking, and mode changes.
 
@@ -44,6 +44,9 @@ select Vencord's `dist` directory in Vesktop settings.
 
 When the focused stream ends, the plugin follows its focus history back to an
 eligible stream that is still running.
+
+Choose **Side-by-side grid** as the display mode to show all watched streams in
+Discord's native grid instead of enlarging one participant.
 
 ## Rules and priorities
 

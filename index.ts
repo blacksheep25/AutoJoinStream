@@ -19,7 +19,7 @@ import {
 } from "@webpack/common";
 
 type StreamMode = "focus-newest" | "watch-all" | "replace";
-type DisplayMode = "normal" | "fullscreen" | "popout";
+type DisplayMode = "normal" | "grid" | "fullscreen" | "popout";
 
 interface DiscordStream {
     channelId: string;
@@ -51,6 +51,7 @@ const settings = definePluginSettings({
         description: "How to display an automatically focused stream",
         options: [
             { label: "Normal focus", value: "normal", default: true },
+            { label: "Side-by-side grid", value: "grid" },
             { label: "Fullscreen", value: "fullscreen" },
             { label: "Pop-out window", value: "popout" }
         ],
@@ -258,14 +259,18 @@ function watch(entry: StreamEntry, allowMultiple: boolean): boolean {
 
 function applyDisplayMode(channelId: string, streamKey: string) {
     const displayMode = settings.store.displayMode as DisplayMode;
+    const channel = ChannelStore.getChannel(channelId);
+    const defaultLayout = channel?.isGuildVocalOrThread() ? "no-chat" : "normal";
+
     if (displayMode === "fullscreen") {
         dispatch({ type: "CHANNEL_RTC_UPDATE_LAYOUT", channelId, layout: "full-screen", appContext: "APP" });
     } else if (displayMode === "popout") {
         dispatch({ type: "CALL_TILE_POPOUT_WINDOW_OPEN", channelId, participantId: streamKey });
+    } else if (displayMode === "grid") {
+        dispatch({ type: "CHANNEL_RTC_UPDATE_LAYOUT", channelId, layout: defaultLayout, appContext: "APP" });
+        dispatch({ type: "CHANNEL_RTC_SELECT_PARTICIPANT", channelId, id: null });
     } else {
-        const channel = ChannelStore.getChannel(channelId);
-        const layout = channel?.isGuildVocalOrThread() ? "no-chat" : "normal";
-        dispatch({ type: "CHANNEL_RTC_UPDATE_LAYOUT", channelId, layout, appContext: "APP" });
+        dispatch({ type: "CHANNEL_RTC_UPDATE_LAYOUT", channelId, layout: defaultLayout, appContext: "APP" });
     }
 }
 
