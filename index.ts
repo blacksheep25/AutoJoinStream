@@ -12,6 +12,7 @@ import {
     ApplicationStreamingStore,
     ChannelStore,
     FluxDispatcher,
+    MediaEngineStore,
     SelectedChannelStore,
     showToast,
     Toasts,
@@ -62,6 +63,12 @@ const settings = definePluginSettings({
         description: "Show your own screen share as a tile in side-by-side grid mode",
         default: false,
         onChange: () => applyCurrentDisplayMode()
+    },
+    autoMuteStreams: {
+        type: OptionType.BOOLEAN,
+        description: "Automatically mute audio from streams watched by the plugin",
+        default: false,
+        onChange: () => applyAutoMuteSetting()
     },
     switchDelay: {
         type: OptionType.SLIDER,
@@ -135,6 +142,7 @@ const knownStreamKeys = new Set<string>();
 const streamOrder = new Map<string, number>();
 const focusHistory: string[] = [];
 const selfStreamsHiddenByPlugin = new Set<string>();
+const autoMutedStreamVolumes = new Map<string, number>();
 
 let scanTimer: ReturnType<typeof setTimeout> | undefined;
 let lastChannelId: string | undefined;
@@ -142,6 +150,7 @@ let focusedStreamKey: string | undefined;
 let sequence = 0;
 let sessionLocked = false;
 let internalSelection = false;
+let internalStreamVolumeChange = false;
 let lastAutoFocusAt = 0;
 let compatible = true;
 let lastError: string | undefined;
@@ -261,7 +270,57 @@ function pickHistoryFallback(entries: StreamEntry[]): StreamEntry | undefined {
 }
 
 function watch(entry: StreamEntry, allowMultiple: boolean): boolean {
-    return dispatch({ type: "STREAM_WATCH", streamKey: entry.key, allowMultiple });
+    const watched = dispatch({ type: "STREAM_WATCH", streamKey: entry.key, allowMultiple });
+    if (!watched) return false;
+
+    if (!allowMultiple) {
+        for (const userId of [...autoMutedStreamVolumes.keys()]) {
+            if (userId !== entry.stream.ownerId) restoreAutoMutedStream(userId);
+        }
+    }
+    autoMuteStream(entry);
+    return true;
+}
+
+function setStreamVolume(userId: string, volume: number) {
+    internalStreamVolumeChange = true;
+    dispatch({ type: "AUDIO_SET_LOCAL_VOLUME", userId, volume, context: "stream" });
+    internalStreamVolumeChange = false;
+}
+
+function autoMuteStream(entry: StreamEntry) {
+    if (!settings.store.autoMuteStreams || autoMutedStreamVolumes.has(entry.stream.ownerId)) return;
+
+    const oldVolume = MediaEngineStore.getLocalVolume(entry.stream.ownerId, "stream");
+    autoMutedStreamVolumes.set(entry.stream.ownerId, oldVolume);
+    setStreamVolume(entry.stream.ownerId, 0);
+}
+
+function restoreAutoMutedStream(userId: string) {
+    const oldVolume = autoMutedStreamVolumes.get(userId);
+    if (oldVolume === undefined) return;
+
+    autoMutedStreamVolumes.delete(userId);
+    if (MediaEngineStore.getLocalVolume(userId, "stream") === 0) setStreamVolume(userId, oldVolume);
+}
+
+function restoreAllAutoMutedStreams() {
+    for (const userId of [...autoMutedStreamVolumes.keys()]) restoreAutoMutedStream(userId);
+}
+
+function applyAutoMuteSetting() {
+    if (!settings.store.autoMuteStreams) {
+        restoreAllAutoMutedStreams();
+        return;
+    }
+
+    const channelId = SelectedChannelStore.getVoiceChannelId();
+    if (!channelId) return;
+    const entries = getEntries(channelId);
+    const managedEntries = settings.store.streamMode === "replace"
+        ? entries.filter(entry => entry.key === focusedStreamKey)
+        : entries;
+    for (const entry of managedEntries) autoMuteStream(entry);
 }
 
 function setOwnStreamHidden(channelId: string, hidden: boolean) {
@@ -332,6 +391,7 @@ function scanForStreams() {
     const currentChannelId = SelectedChannelStore.getVoiceChannelId();
     if (currentChannelId !== lastChannelId) {
         if (lastChannelId) setOwnStreamHidden(lastChannelId, false);
+        restoreAllAutoMutedStreams();
         clearRuntimeState();
         lastChannelId = currentChannelId;
     }
@@ -339,6 +399,10 @@ function scanForStreams() {
 
     const entries = getEntries(currentChannelId);
     const activeKeys = new Set(entries.map(entry => entry.key));
+    const activeOwnerIds = new Set(entries.map(entry => entry.stream.ownerId));
+    for (const userId of [...autoMutedStreamVolumes.keys()]) {
+        if (!activeOwnerIds.has(userId)) restoreAutoMutedStream(userId);
+    }
 
     for (const key of knownStreamKeys) {
         if (!activeKeys.has(key)) {
@@ -472,6 +536,9 @@ export default definePlugin({
                 if (settings.store.pauseOnManualFocus && knownStreamKeys.size > 0) setLocked(true);
             }
         },
+        AUDIO_SET_LOCAL_VOLUME({ userId, context }: { userId: string; context?: string; }) {
+            if (!internalStreamVolumeChange && context === "stream") autoMutedStreamVolumes.delete(userId);
+        },
         STREAM_TIMED_OUT({ streamKey }: { streamKey: string; }) {
             if (knownStreamKeys.has(streamKey)) notify("A watched stream timed out", Toasts.Type.FAILURE);
         }
@@ -493,6 +560,7 @@ export default definePlugin({
             dispatch({ type: "STREAM_UPDATE_SELF_HIDDEN", channelId, selfStreamHidden: false });
         }
         selfStreamsHiddenByPlugin.clear();
+        restoreAllAutoMutedStreams();
         clearRuntimeState();
         lastChannelId = undefined;
         sessionLocked = false;

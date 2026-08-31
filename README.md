@@ -51,6 +51,10 @@ Discord's native grid instead of enlarging one participant.
 Your own screen share is hidden from the grid by default to avoid wasting a
 tile. Enable **Show your own stream in grid** if you want to include it.
 
+Enable **Automatically mute watched streams** to start plugin-managed streams
+with their shared audio muted. Voice chat remains audible, manual stream-volume
+changes are respected, and previous stream volumes are restored when possible.
+
 ## Rules and priorities
 
 All ID settings accept comma-separated Discord IDs:
