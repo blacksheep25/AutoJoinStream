@@ -48,6 +48,9 @@ eligible stream that is still running.
 Choose **Side-by-side grid** as the display mode to show all watched streams in
 Discord's native grid instead of enlarging one participant.
 
+Your own screen share is hidden from the grid by default to avoid wasting a
+tile. Enable **Show your own stream in grid** if you want to include it.
+
 ## Rules and priorities
 
 All ID settings accept comma-separated Discord IDs:

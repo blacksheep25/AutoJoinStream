@@ -57,6 +57,12 @@ const settings = definePluginSettings({
         ],
         onChange: () => applyCurrentDisplayMode()
     },
+    showOwnStreamInGrid: {
+        type: OptionType.BOOLEAN,
+        description: "Show your own screen share as a tile in side-by-side grid mode",
+        default: false,
+        onChange: () => applyCurrentDisplayMode()
+    },
     switchDelay: {
         type: OptionType.SLIDER,
         description: "Seconds to wait before handling a new stream",
@@ -128,6 +134,7 @@ const settings = definePluginSettings({
 const knownStreamKeys = new Set<string>();
 const streamOrder = new Map<string, number>();
 const focusHistory: string[] = [];
+const selfStreamsHiddenByPlugin = new Set<string>();
 
 let scanTimer: ReturnType<typeof setTimeout> | undefined;
 let lastChannelId: string | undefined;
@@ -257,19 +264,34 @@ function watch(entry: StreamEntry, allowMultiple: boolean): boolean {
     return dispatch({ type: "STREAM_WATCH", streamKey: entry.key, allowMultiple });
 }
 
+function setOwnStreamHidden(channelId: string, hidden: boolean) {
+    if (hidden) {
+        if (!ApplicationStreamingStore.isSelfStreamHidden(channelId)) {
+            dispatch({ type: "STREAM_UPDATE_SELF_HIDDEN", channelId, selfStreamHidden: true });
+            selfStreamsHiddenByPlugin.add(channelId);
+        }
+    } else if (selfStreamsHiddenByPlugin.delete(channelId)) {
+        dispatch({ type: "STREAM_UPDATE_SELF_HIDDEN", channelId, selfStreamHidden: false });
+    }
+}
+
 function applyDisplayMode(channelId: string, streamKey: string) {
     const displayMode = settings.store.displayMode as DisplayMode;
     const channel = ChannelStore.getChannel(channelId);
     const defaultLayout = channel?.isGuildVocalOrThread() ? "no-chat" : "normal";
 
     if (displayMode === "fullscreen") {
+        setOwnStreamHidden(channelId, false);
         dispatch({ type: "CHANNEL_RTC_UPDATE_LAYOUT", channelId, layout: "full-screen", appContext: "APP" });
     } else if (displayMode === "popout") {
+        setOwnStreamHidden(channelId, false);
         dispatch({ type: "CALL_TILE_POPOUT_WINDOW_OPEN", channelId, participantId: streamKey });
     } else if (displayMode === "grid") {
+        setOwnStreamHidden(channelId, !settings.store.showOwnStreamInGrid);
         dispatch({ type: "CHANNEL_RTC_UPDATE_LAYOUT", channelId, layout: defaultLayout, appContext: "APP" });
         dispatch({ type: "CHANNEL_RTC_SELECT_PARTICIPANT", channelId, id: null });
     } else {
+        setOwnStreamHidden(channelId, false);
         dispatch({ type: "CHANNEL_RTC_UPDATE_LAYOUT", channelId, layout: defaultLayout, appContext: "APP" });
     }
 }
@@ -309,6 +331,7 @@ function scanForStreams() {
 
     const currentChannelId = SelectedChannelStore.getVoiceChannelId();
     if (currentChannelId !== lastChannelId) {
+        if (lastChannelId) setOwnStreamHidden(lastChannelId, false);
         clearRuntimeState();
         lastChannelId = currentChannelId;
     }
@@ -466,6 +489,10 @@ export default definePlugin({
         SelectedChannelStore.removeChangeListener(scheduleScan);
         if (scanTimer !== undefined) clearTimeout(scanTimer);
         scanTimer = undefined;
+        for (const channelId of selfStreamsHiddenByPlugin) {
+            dispatch({ type: "STREAM_UPDATE_SELF_HIDDEN", channelId, selfStreamHidden: false });
+        }
+        selfStreamsHiddenByPlugin.clear();
         clearRuntimeState();
         lastChannelId = undefined;
         sessionLocked = false;
