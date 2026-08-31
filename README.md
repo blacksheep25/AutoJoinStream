@@ -1,41 +1,80 @@
 # AutoJoinStream
 
-A private Vencord user plugin that automatically starts watching a stream when
-someone begins streaming in your current voice channel. It also detects streams
-that were already running when you joined the channel or enabled the plugin.
+A Vencord user plugin that automatically watches, prioritises, and switches
+between Discord streams in your current voice channel. It detects both newly
+started streams and streams that were already running when you joined.
 
-It deliberately does **not** move you into another voice channel. If multiple
-people are streaming, Discord's normal multi-stream behavior still applies.
+AutoJoinStream never moves you into another voice channel.
+
+## Features
+
+- Three multi-stream modes: focus newest, watch all, or replace current.
+- A true focus-history stack that returns to the previously watched stream.
+- Temporary focus locking, including optional locking after manual selection.
+- Ordered user priorities plus user, server, and channel allow/block lists.
+- Configurable switch delay and cooldown.
+- Normal, fullscreen, and stream pop-out display modes.
+- Notifications and compatibility error reporting.
+- `/autostream` commands for status, locking, and mode changes.
 
 ## Install
 
-Custom plugins require a Vencord build from source.
+Custom plugins require a [Vencord source build](https://docs.vencord.dev/installing/custom-plugins/).
 
-1. Copy this entire `autoJoinStream` folder into `Vencord/src/userplugins/`.
-2. From the Vencord repository, run `pnpm build`.
-3. For Discord Desktop, run `pnpm inject` and select your Discord install.
-   For Vesktop, select Vencord's `dist` folder in Vesktop settings instead.
-4. Restart Discord or Vesktop.
-5. Open **Settings > Vencord > Plugins**, find **AutoJoinStream**, and enable it.
+From the Vencord repository:
 
-## Settings
+```sh
+git clone https://github.com/blacksheep25/AutoJoinStream.git src/userplugins/autoJoinStream
+pnpm install --frozen-lockfile
+pnpm build
+```
 
-- **User IDs:** Leave empty to watch anyone in your current voice channel, or
-  enter comma-separated Discord user IDs to restrict automatic watching.
-- **Stream mode:** Controls what happens when multiple people stream:
-  - **Focus newest:** keeps all streams playing and focuses the latest one.
-  - **Watch all:** keeps all streams playing without changing focus after the
-    first stream.
-  - **Replace current:** stops watching the previous stream and focuses the
-    latest one.
+For Discord Desktop, run `pnpm inject`, restart Discord, then enable
+**AutoJoinStream** under **Settings > Vencord > Plugins**. Vesktop users can
+select Vencord's `dist` directory in Vesktop settings.
 
-When the focused stream ends, the plugin returns to the most recently started
+## Stream modes
+
+- **Focus newest:** watches every stream and focuses the newest eligible one.
+  Priority users override recency.
+- **Watch all:** watches every stream without changing focus while the current
+  stream remains active.
+- **Replace current:** disconnects the previous stream and watches only the
+  preferred newest stream.
+
+When the focused stream ends, the plugin follows its focus history back to an
 eligible stream that is still running.
 
-To copy a user ID, enable Discord's Developer Mode, right-click the user, and
-choose **Copy User ID**.
+## Rules and priorities
 
-## Compatibility note
+All ID settings accept comma-separated Discord IDs:
 
-Discord's client internals are not a public API. A Discord update can rename the
-internal stream action and require this plugin's module lookup to be adjusted.
+- **Allowed users:** empty means everyone; otherwise only listed users qualify.
+- **Blocked users:** always excluded, even if present in the allowed list.
+- **Priority users:** ordered from highest to lowest priority.
+- **Allowed/blocked servers and channels:** scope automatic watching to the
+  places where you want it.
+
+Enable Discord Developer Mode and right-click a user, server, or channel to copy
+its ID.
+
+## Commands
+
+- `/autostream lock` pauses automatic focus changes for the current session.
+- `/autostream unlock` resumes automatic focus changes.
+- `/autostream status` shows mode, lock, channel, detected streams, and errors.
+- `/autostream mode` changes multi-stream behavior.
+
+## Development
+
+The GitHub workflow tests the plugin against current Vencord using ESLint,
+TypeScript, and a full build. Tags matching `v*` create a GitHub release with a
+ready-to-copy zip archive.
+
+Discord client internals are not a public API. AutoJoinStream validates the
+required store on startup and reports compatibility failures through a toast and
+`/autostream status`.
+
+## License
+
+GPL-3.0-or-later. See [LICENSE](LICENSE).
