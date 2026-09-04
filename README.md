@@ -89,7 +89,8 @@ its ID.
 
 The GitHub workflow tests the plugin against current Vencord using ESLint,
 TypeScript, and a full build. Tags matching `v*` create a GitHub release with a
-ready-to-copy zip archive.
+ready-to-copy zip archive. Release notes are sourced from [CHANGELOG.md](CHANGELOG.md),
+and publishing fails when the tagged version has no matching changelog entry.
 
 Discord client internals are not a public API. AutoJoinStream validates the
 required store on startup and reports compatibility failures through a toast and
