@@ -10,6 +10,7 @@ import { Logger } from "@utils/Logger";
 import definePlugin, { OptionType } from "@utils/types";
 import {
     ApplicationStreamingStore,
+    ChannelRTCStore,
     ChannelStore,
     FluxDispatcher,
     MediaEngineStore,
@@ -20,7 +21,18 @@ import {
 } from "@webpack/common";
 
 type StreamMode = "focus-newest" | "watch-all" | "replace";
-type DisplayMode = "normal" | "grid" | "fullscreen" | "popout";
+type DisplayMode = "normal" | "auto" | "grid" | "fullscreen" | "popout";
+type ConcreteDisplayMode = Exclude<DisplayMode, "auto">;
+
+interface ManagedStreamVolume {
+    applied: number;
+    previous: number;
+}
+
+interface ManagedLayout {
+    applied: string;
+    previous: string;
+}
 
 interface DiscordStream {
     channelId: string;
@@ -52,11 +64,24 @@ const settings = definePluginSettings({
         description: "How to display an automatically focused stream",
         options: [
             { label: "Normal focus", value: "normal", default: true },
+            { label: "Automatic (focus one, grid multiple)", value: "auto" },
             { label: "Side-by-side grid", value: "grid" },
             { label: "Fullscreen", value: "fullscreen" },
             { label: "Pop-out window", value: "popout" }
         ],
         onChange: () => applyCurrentDisplayMode()
+    },
+    autoMaximizeStream: {
+        type: OptionType.BOOLEAN,
+        description: "Automatically maximize a focused stream when not using grid or pop-out mode",
+        default: false,
+        onChange: () => applyCurrentDisplayMode()
+    },
+    autoHideMembers: {
+        type: OptionType.BOOLEAN,
+        description: "Automatically close the member panel while displaying a stream",
+        default: false,
+        onChange: () => applyMemberPanelSetting()
     },
     showOwnStreamInGrid: {
         type: OptionType.BOOLEAN,
@@ -66,9 +91,24 @@ const settings = definePluginSettings({
     },
     autoMuteStreams: {
         type: OptionType.BOOLEAN,
-        description: "Automatically mute audio from streams watched by the plugin",
+        description: "Legacy automatic-mute setting",
         default: false,
-        onChange: () => applyAutoMuteSetting()
+        hidden: true
+    },
+    streamVolume: {
+        type: OptionType.SELECT,
+        description: "Audio volume to apply to streams watched by the plugin",
+        options: [
+            { label: "Leave unchanged", value: -1, default: true },
+            { label: "Muted", value: 0 },
+            { label: "25%", value: 25 },
+            { label: "50%", value: 50 },
+            { label: "75%", value: 75 },
+            { label: "100%", value: 100 },
+            { label: "150%", value: 150 },
+            { label: "200%", value: 200 }
+        ],
+        onChange: () => applyStreamVolumeSetting()
     },
     switchDelay: {
         type: OptionType.SLIDER,
@@ -88,6 +128,13 @@ const settings = definePluginSettings({
         type: OptionType.BOOLEAN,
         description: "Lock automatic focus after you manually select a different stream",
         default: true
+    },
+    manualLockMinutes: {
+        type: OptionType.SLIDER,
+        description: "Minutes to lock after manual stream selection; 0 stays locked until manually unlocked",
+        markers: [0, 5, 15, 30, 60],
+        default: 0,
+        stickToMarkers: true
     },
     notifications: {
         type: OptionType.BOOLEAN,
@@ -142,7 +189,9 @@ const knownStreamKeys = new Set<string>();
 const streamOrder = new Map<string, number>();
 const focusHistory: string[] = [];
 const selfStreamsHiddenByPlugin = new Set<string>();
-const autoMutedStreamVolumes = new Map<string, number>();
+const managedStreamVolumes = new Map<string, ManagedStreamVolume>();
+const membersHiddenByPlugin = new Set<string>();
+const managedLayouts = new Map<string, ManagedLayout>();
 
 let scanTimer: ReturnType<typeof setTimeout> | undefined;
 let lastChannelId: string | undefined;
@@ -151,7 +200,12 @@ let sequence = 0;
 let sessionLocked = false;
 let internalSelection = false;
 let internalStreamVolumeChange = false;
+let internalMemberPanelChange = false;
+let internalLayoutChange = false;
 let lastAutoFocusAt = 0;
+let lockTimer: ReturnType<typeof setTimeout> | undefined;
+let lockedUntil: number | undefined;
+let lastActiveStreamCount = 0;
 let compatible = true;
 let lastError: string | undefined;
 let errorToastShown = false;
@@ -274,11 +328,11 @@ function watch(entry: StreamEntry, allowMultiple: boolean): boolean {
     if (!watched) return false;
 
     if (!allowMultiple) {
-        for (const userId of [...autoMutedStreamVolumes.keys()]) {
-            if (userId !== entry.stream.ownerId) restoreAutoMutedStream(userId);
+        for (const userId of [...managedStreamVolumes.keys()]) {
+            if (userId !== entry.stream.ownerId) restoreManagedStreamVolume(userId);
         }
     }
-    autoMuteStream(entry);
+    applyConfiguredStreamVolume(entry);
     return true;
 }
 
@@ -288,31 +342,35 @@ function setStreamVolume(userId: string, volume: number) {
     internalStreamVolumeChange = false;
 }
 
-function autoMuteStream(entry: StreamEntry) {
-    if (!settings.store.autoMuteStreams || autoMutedStreamVolumes.has(entry.stream.ownerId)) return;
+function applyConfiguredStreamVolume(entry: StreamEntry) {
+    const configuredVolume = Number(settings.store.streamVolume);
+    if (configuredVolume < 0 || managedStreamVolumes.has(entry.stream.ownerId)) return;
 
     const oldVolume = MediaEngineStore.getLocalVolume(entry.stream.ownerId, "stream");
-    autoMutedStreamVolumes.set(entry.stream.ownerId, oldVolume);
-    setStreamVolume(entry.stream.ownerId, 0);
+    managedStreamVolumes.set(entry.stream.ownerId, {
+        applied: configuredVolume,
+        previous: oldVolume
+    });
+    setStreamVolume(entry.stream.ownerId, configuredVolume);
 }
 
-function restoreAutoMutedStream(userId: string) {
-    const oldVolume = autoMutedStreamVolumes.get(userId);
-    if (oldVolume === undefined) return;
+function restoreManagedStreamVolume(userId: string) {
+    const managedVolume = managedStreamVolumes.get(userId);
+    if (!managedVolume) return;
 
-    autoMutedStreamVolumes.delete(userId);
-    if (MediaEngineStore.getLocalVolume(userId, "stream") === 0) setStreamVolume(userId, oldVolume);
-}
-
-function restoreAllAutoMutedStreams() {
-    for (const userId of [...autoMutedStreamVolumes.keys()]) restoreAutoMutedStream(userId);
-}
-
-function applyAutoMuteSetting() {
-    if (!settings.store.autoMuteStreams) {
-        restoreAllAutoMutedStreams();
-        return;
+    managedStreamVolumes.delete(userId);
+    if (MediaEngineStore.getLocalVolume(userId, "stream") === managedVolume.applied) {
+        setStreamVolume(userId, managedVolume.previous);
     }
+}
+
+function restoreAllManagedStreamVolumes() {
+    for (const userId of [...managedStreamVolumes.keys()]) restoreManagedStreamVolume(userId);
+}
+
+function applyStreamVolumeSetting() {
+    restoreAllManagedStreamVolumes();
+    if (Number(settings.store.streamVolume) < 0) return;
 
     const channelId = SelectedChannelStore.getVoiceChannelId();
     if (!channelId) return;
@@ -320,7 +378,7 @@ function applyAutoMuteSetting() {
     const managedEntries = settings.store.streamMode === "replace"
         ? entries.filter(entry => entry.key === focusedStreamKey)
         : entries;
-    for (const entry of managedEntries) autoMuteStream(entry);
+    for (const entry of managedEntries) applyConfiguredStreamVolume(entry);
 }
 
 function setOwnStreamHidden(channelId: string, hidden: boolean) {
@@ -334,30 +392,116 @@ function setOwnStreamHidden(channelId: string, hidden: boolean) {
     }
 }
 
+function getDefaultLayout(channelId: string): "normal" | "no-chat" {
+    return ChannelStore.getChannel(channelId)?.isGuildVocalOrThread() ? "no-chat" : "normal";
+}
+
+function setManagedLayout(channelId: string, layout: string) {
+    const currentLayout = ChannelRTCStore.getLayout(channelId, "APP");
+    const managedLayout = managedLayouts.get(channelId);
+    if (!managedLayout && currentLayout === layout) return;
+
+    const state = managedLayout ?? { applied: layout, previous: currentLayout };
+    state.applied = layout;
+    managedLayouts.set(channelId, state);
+
+    internalLayoutChange = true;
+    dispatch({ type: "CHANNEL_RTC_UPDATE_LAYOUT", channelId, layout, appContext: "APP" });
+    internalLayoutChange = false;
+}
+
+function restoreManagedLayout(channelId: string) {
+    const managedLayout = managedLayouts.get(channelId);
+    if (!managedLayout) return;
+
+    managedLayouts.delete(channelId);
+    if (ChannelRTCStore.getLayout(channelId, "APP") !== managedLayout.applied) return;
+
+    internalLayoutChange = true;
+    dispatch({
+        type: "CHANNEL_RTC_UPDATE_LAYOUT",
+        channelId,
+        layout: managedLayout.previous,
+        appContext: "APP"
+    });
+    internalLayoutChange = false;
+}
+
+function setMemberPanelHidden(channelId: string, hidden: boolean) {
+    if (hidden) {
+        if (!ChannelRTCStore.getParticipantsOpen(channelId)) return;
+
+        internalMemberPanelChange = true;
+        const changed = dispatch({
+            type: "CHANNEL_RTC_UPDATE_PARTICIPANTS_OPEN",
+            channelId,
+            participantsOpen: false
+        });
+        internalMemberPanelChange = false;
+        if (changed) membersHiddenByPlugin.add(channelId);
+    } else if (membersHiddenByPlugin.delete(channelId) && !ChannelRTCStore.getParticipantsOpen(channelId)) {
+        internalMemberPanelChange = true;
+        dispatch({
+            type: "CHANNEL_RTC_UPDATE_PARTICIPANTS_OPEN",
+            channelId,
+            participantsOpen: true
+        });
+        internalMemberPanelChange = false;
+    }
+}
+
+function applyMemberPanelSetting() {
+    if (!settings.store.autoHideMembers) {
+        for (const channelId of [...membersHiddenByPlugin]) setMemberPanelHidden(channelId, false);
+        return;
+    }
+
+    const channelId = SelectedChannelStore.getVoiceChannelId();
+    if (channelId && focusedStreamKey) setMemberPanelHidden(channelId, true);
+}
+
+function resolveDisplayMode(channelId: string): ConcreteDisplayMode {
+    const configuredMode = settings.store.displayMode as DisplayMode;
+    let displayMode: ConcreteDisplayMode = configuredMode === "auto"
+        ? getEntries(channelId).length > 1 ? "grid" : "normal"
+        : configuredMode;
+
+    if (displayMode === "normal" && settings.store.autoMaximizeStream) displayMode = "fullscreen";
+    return displayMode;
+}
+
 function applyDisplayMode(channelId: string, streamKey: string) {
-    const displayMode = settings.store.displayMode as DisplayMode;
-    const channel = ChannelStore.getChannel(channelId);
-    const defaultLayout = channel?.isGuildVocalOrThread() ? "no-chat" : "normal";
+    const displayMode = resolveDisplayMode(channelId);
+    const defaultLayout = getDefaultLayout(channelId);
 
     if (displayMode === "fullscreen") {
         setOwnStreamHidden(channelId, false);
-        dispatch({ type: "CHANNEL_RTC_UPDATE_LAYOUT", channelId, layout: "full-screen", appContext: "APP" });
+        setManagedLayout(channelId, "full-screen");
     } else if (displayMode === "popout") {
         setOwnStreamHidden(channelId, false);
+        restoreManagedLayout(channelId);
         dispatch({ type: "CALL_TILE_POPOUT_WINDOW_OPEN", channelId, participantId: streamKey });
     } else if (displayMode === "grid") {
         setOwnStreamHidden(channelId, !settings.store.showOwnStreamInGrid);
-        dispatch({ type: "CHANNEL_RTC_UPDATE_LAYOUT", channelId, layout: defaultLayout, appContext: "APP" });
+        setManagedLayout(channelId, defaultLayout);
         dispatch({ type: "CHANNEL_RTC_SELECT_PARTICIPANT", channelId, id: null });
     } else {
         setOwnStreamHidden(channelId, false);
-        dispatch({ type: "CHANNEL_RTC_UPDATE_LAYOUT", channelId, layout: defaultLayout, appContext: "APP" });
+        setManagedLayout(channelId, defaultLayout);
     }
+
+    setMemberPanelHidden(channelId, settings.store.autoHideMembers);
 }
 
 function applyCurrentDisplayMode() {
     const channelId = SelectedChannelStore.getVoiceChannelId();
     if (channelId && focusedStreamKey) applyDisplayMode(channelId, focusedStreamKey);
+}
+
+function restoreManagedUi(channelId: string) {
+    setOwnStreamHidden(channelId, false);
+    setMemberPanelHidden(channelId, false);
+    restoreManagedLayout(channelId);
 }
 
 function focus(entry: StreamEntry, reason: "new" | "fallback" | "command"): boolean {
@@ -390,8 +534,9 @@ function scanForStreams() {
 
     const currentChannelId = SelectedChannelStore.getVoiceChannelId();
     if (currentChannelId !== lastChannelId) {
-        if (lastChannelId) setOwnStreamHidden(lastChannelId, false);
-        restoreAllAutoMutedStreams();
+        if (lastChannelId) restoreManagedUi(lastChannelId);
+        restoreAllManagedStreamVolumes();
+        setLocked(false, false);
         clearRuntimeState();
         lastChannelId = currentChannelId;
     }
@@ -400,9 +545,12 @@ function scanForStreams() {
     const entries = getEntries(currentChannelId);
     const activeKeys = new Set(entries.map(entry => entry.key));
     const activeOwnerIds = new Set(entries.map(entry => entry.stream.ownerId));
-    for (const userId of [...autoMutedStreamVolumes.keys()]) {
-        if (!activeOwnerIds.has(userId)) restoreAutoMutedStream(userId);
+    for (const userId of [...managedStreamVolumes.keys()]) {
+        if (!activeOwnerIds.has(userId)) restoreManagedStreamVolume(userId);
     }
+
+    const streamCountChanged = entries.length !== lastActiveStreamCount;
+    lastActiveStreamCount = entries.length;
 
     for (const key of knownStreamKeys) {
         if (!activeKeys.has(key)) {
@@ -426,6 +574,16 @@ function scanForStreams() {
     }
 
     const focusedIsActive = !!focusedStreamKey && activeKeys.has(focusedStreamKey);
+    if (entries.length === 0) {
+        restoreManagedUi(currentChannelId);
+        focusedStreamKey = undefined;
+        return;
+    }
+
+    if (streamCountChanged && settings.store.displayMode === "auto" && focusedIsActive && focusedStreamKey) {
+        applyDisplayMode(currentChannelId, focusedStreamKey);
+    }
+
     let target: StreamEntry | undefined;
     let reason: "new" | "fallback" = "new";
 
@@ -463,12 +621,58 @@ function clearRuntimeState() {
     focusHistory.length = 0;
     focusedStreamKey = undefined;
     sequence = 0;
+    lastActiveStreamCount = 0;
 }
 
-function setLocked(locked: boolean, announce = true) {
+function setLocked(locked: boolean, announce = true, durationMinutes = 0) {
+    const wasLocked = sessionLocked;
+    if (lockTimer !== undefined) clearTimeout(lockTimer);
+    lockTimer = undefined;
+    lockedUntil = undefined;
     sessionLocked = locked;
-    if (announce) notify(`AutoJoinStream focus ${locked ? "locked" : "unlocked"}`);
-    if (!locked) scheduleScan(0);
+    if (locked && durationMinutes > 0) {
+        lockedUntil = Date.now() + durationMinutes * 60_000;
+        lockTimer = setTimeout(() => setLocked(false), durationMinutes * 60_000);
+    }
+
+    if (announce) {
+        const duration = locked && durationMinutes > 0 ? ` for ${durationMinutes} minutes` : "";
+        notify(`AutoJoinStream focus ${locked ? `locked${duration}` : "unlocked"}`);
+    }
+    if (!locked && wasLocked) scheduleScan(0);
+}
+
+function cycleStream(direction: 1 | -1): boolean {
+    const channelId = SelectedChannelStore.getVoiceChannelId();
+    if (!channelId) return false;
+
+    const entries = getEntries(channelId).toSorted((a, b) =>
+        (streamOrder.get(a.key) ?? 0) - (streamOrder.get(b.key) ?? 0)
+    );
+    if (entries.length === 0) return false;
+
+    const currentIndex = entries.findIndex(entry => entry.key === focusedStreamKey);
+    const targetIndex = currentIndex === -1
+        ? direction === 1 ? 0 : entries.length - 1
+        : (currentIndex + direction + entries.length) % entries.length;
+    const target = entries[targetIndex];
+    const allowMultiple = settings.store.streamMode !== "replace";
+    if (!watch(target, allowMultiple) || !focus(target, "command")) return false;
+
+    setLocked(true, false, settings.store.manualLockMinutes);
+    return true;
+}
+
+function setFocusedStreamVolume(volume: number): boolean {
+    const channelId = SelectedChannelStore.getVoiceChannelId();
+    if (!channelId || !focusedStreamKey) return false;
+
+    const entry = getEntries(channelId).find(candidate => candidate.key === focusedStreamKey);
+    if (!entry) return false;
+
+    managedStreamVolumes.delete(entry.stream.ownerId);
+    setStreamVolume(entry.stream.ownerId, volume);
+    return true;
 }
 
 function getStatus(): string {
@@ -477,7 +681,10 @@ function getStatus(): string {
         `**AutoJoinStream:** ${compatible ? "compatible" : "compatibility error"}`,
         `**Mode:** ${settings.store.streamMode}`,
         `**Display:** ${settings.store.displayMode}`,
-        `**Focus lock:** ${sessionLocked ? "locked" : "unlocked"}`,
+        `**Stream volume:** ${Number(settings.store.streamVolume) < 0 ? "unchanged" : `${settings.store.streamVolume}%`}`,
+        `**Focus lock:** ${sessionLocked
+            ? lockedUntil ? `locked until ${new Date(lockedUntil).toLocaleTimeString()}` : "locked"
+            : "unlocked"}`,
         `**Voice channel:** ${channelId ?? "not connected"}`,
         `**Detected streams:** ${knownStreamKeys.size}`,
         lastError ? `**Last error:** ${lastError}` : null
@@ -496,8 +703,30 @@ export default definePlugin({
         description: "Control AutoJoinStream",
         inputType: ApplicationCommandInputType.BUILT_IN,
         options: [
-            { name: "lock", description: "Temporarily stop automatic focus changes", type: ApplicationCommandOptionType.SUB_COMMAND },
+            {
+                name: "lock",
+                description: "Temporarily stop automatic focus changes",
+                type: ApplicationCommandOptionType.SUB_COMMAND,
+                options: [{
+                    name: "minutes",
+                    description: "Automatically unlock after this many minutes; omit to stay locked",
+                    type: ApplicationCommandOptionType.INTEGER
+                }]
+            },
             { name: "unlock", description: "Resume automatic focus changes", type: ApplicationCommandOptionType.SUB_COMMAND },
+            { name: "next", description: "Focus the next active stream", type: ApplicationCommandOptionType.SUB_COMMAND },
+            { name: "previous", description: "Focus the previous active stream", type: ApplicationCommandOptionType.SUB_COMMAND },
+            {
+                name: "volume",
+                description: "Set the focused stream's volume",
+                type: ApplicationCommandOptionType.SUB_COMMAND,
+                options: [{
+                    name: "percent",
+                    description: "Volume from 0 to 200 percent",
+                    type: ApplicationCommandOptionType.INTEGER,
+                    required: true
+                }]
+            },
             { name: "status", description: "Show plugin status and compatibility", type: ApplicationCommandOptionType.SUB_COMMAND },
             {
                 name: "mode",
@@ -518,8 +747,17 @@ export default definePlugin({
         ],
         execute(args, ctx) {
             const subcommand = args[0];
-            if (subcommand.name === "lock") setLocked(true);
+            if (subcommand.name === "lock") {
+                const minutes = Math.min(1440, Math.max(0, Number(findOption(subcommand.options, "minutes", 0))));
+                setLocked(true, true, minutes);
+            }
             else if (subcommand.name === "unlock") setLocked(false);
+            else if (subcommand.name === "next") cycleStream(1);
+            else if (subcommand.name === "previous") cycleStream(-1);
+            else if (subcommand.name === "volume") {
+                const volume = Math.min(200, Math.max(0, Number(findOption(subcommand.options, "percent", 100))));
+                setFocusedStreamVolume(volume);
+            }
             else if (subcommand.name === "mode") {
                 settings.store.streamMode = findOption(subcommand.options, "value", "focus-newest") as StreamMode;
                 resetAndScan();
@@ -533,11 +771,19 @@ export default definePlugin({
             if (internalSelection) return;
             if (id?.startsWith("guild:") || id?.startsWith("call:")) {
                 rememberFocus(id);
-                if (settings.store.pauseOnManualFocus && knownStreamKeys.size > 0) setLocked(true);
+                if (settings.store.pauseOnManualFocus && knownStreamKeys.size > 0) {
+                    setLocked(true, true, settings.store.manualLockMinutes);
+                }
             }
         },
         AUDIO_SET_LOCAL_VOLUME({ userId, context }: { userId: string; context?: string; }) {
-            if (!internalStreamVolumeChange && context === "stream") autoMutedStreamVolumes.delete(userId);
+            if (!internalStreamVolumeChange && context === "stream") managedStreamVolumes.delete(userId);
+        },
+        CHANNEL_RTC_UPDATE_LAYOUT({ channelId, appContext }: { channelId: string; appContext?: string; }) {
+            if (!internalLayoutChange && (!appContext || appContext === "APP")) managedLayouts.delete(channelId);
+        },
+        CHANNEL_RTC_UPDATE_PARTICIPANTS_OPEN({ channelId }: { channelId: string; }) {
+            if (!internalMemberPanelChange) membersHiddenByPlugin.delete(channelId);
         },
         STREAM_TIMED_OUT({ streamKey }: { streamKey: string; }) {
             if (knownStreamKeys.has(streamKey)) notify("A watched stream timed out", Toasts.Type.FAILURE);
@@ -545,6 +791,10 @@ export default definePlugin({
     },
 
     start() {
+        if (settings.store.autoMuteStreams && Number(settings.store.streamVolume) < 0) {
+            settings.store.streamVolume = 0;
+            settings.store.autoMuteStreams = false;
+        }
         validateCompatibility();
         ApplicationStreamingStore.addChangeListener(scheduleScan);
         SelectedChannelStore.addChangeListener(scheduleScan);
@@ -556,13 +806,20 @@ export default definePlugin({
         SelectedChannelStore.removeChangeListener(scheduleScan);
         if (scanTimer !== undefined) clearTimeout(scanTimer);
         scanTimer = undefined;
+        if (lockTimer !== undefined) clearTimeout(lockTimer);
+        lockTimer = undefined;
         for (const channelId of selfStreamsHiddenByPlugin) {
             dispatch({ type: "STREAM_UPDATE_SELF_HIDDEN", channelId, selfStreamHidden: false });
         }
         selfStreamsHiddenByPlugin.clear();
-        restoreAllAutoMutedStreams();
+        for (const channelId of new Set([
+            ...membersHiddenByPlugin,
+            ...managedLayouts.keys()
+        ])) restoreManagedUi(channelId);
+        restoreAllManagedStreamVolumes();
         clearRuntimeState();
         lastChannelId = undefined;
         sessionLocked = false;
+        lockedUntil = undefined;
     }
 });
